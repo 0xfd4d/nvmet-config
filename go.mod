@@ -1,4 +1,4 @@
-module nvmet-config
+module github.com/0xfd4d/nvmet-config
 
 go 1.17
 
