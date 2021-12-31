@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -9,28 +10,88 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// Nvmf yaml config struct
+// Nvmf struct
 type Nvmf struct {
-	Ports []struct {
-		Name        string `yaml:"name"`
-		AddrAdrfam  string `yaml:"addr_adrfam"`
-		AddrTraddr  string `yaml:"addr_traddr"`
-		AddrTrsvcid int    `yaml:"addr_trsvcid"`
-		AddrTrtype  string `yaml:"addr_trtype"`
-		Subsystems  []struct {
-			Name string `yaml:"name"`
-		} `yaml:"subsystems"`
-	} `yaml:"ports"`
-	Subsystems []struct {
-		Name             string `yaml:"name"`
-		AttrAllowAnyHost int    `yaml:"attr_allow_any_host"`
-		Namespaces       []struct {
-			Name       int    `yaml:"name"`
-			Enable     int    `yaml:"enable" default:"1"`
-			DevicePath string `yaml:"device_path"`
-			DeviceUUID string `yaml:"device_uuid"`
-		} `yaml:"namespaces"`
-	} `yaml:"subsystems"`
+	Ports      []NvmfPort      `yaml:"ports"`
+	Subsystems []NvmfSubsystem `yaml:"subsystems"`
+}
+
+// NvmfPort struct
+type NvmfPort struct {
+	Name        string                `yaml:"name"`
+	AddrAdrfam  string                `yaml:"addr_adrfam"`
+	AddrTraddr  string                `yaml:"addr_traddr"`
+	AddrTrsvcid int                   `yaml:"addr_trsvcid"`
+	AddrTrtype  string                `yaml:"addr_trtype"`
+	Subsystems  []NvmfPortsSubsystems `yaml:"subsystems"`
+}
+
+// NvmfPortsSubsystems struct
+type NvmfPortsSubsystems struct {
+	Name string `yaml:"name"`
+}
+
+// NvmfSubsystem struct
+type NvmfSubsystem struct {
+	Name             string          `yaml:"name"`
+	AttrAllowAnyHost int             `yaml:"attr_allow_any_host"`
+	Namespaces       []NvmfNamespace `yaml:"namespaces"`
+}
+
+// NvmfNamespace struct
+type NvmfNamespace struct {
+	Name       int    `yaml:"name"`
+	Enable     int    `yaml:"enable" default:"1"`
+	DevicePath string `yaml:"device_path"`
+	DeviceUUID string `yaml:"device_uuid"`
+}
+
+func (subsystem NvmfSubsystem) createSubsystem() error {
+	path := filepath.Join("/sys/kernel/config/nvmet/subsystems", subsystem.Name)
+	err := os.MkdirAll(path, os.ModePerm)
+	return err
+}
+
+func (subsystem NvmfSubsystem) writeAllowAnyHost() error {
+	err := subsystem.writeSubsystemAttr("attr_allow_any_host", "1")
+	return err
+}
+
+func (subsystem NvmfSubsystem) writeSubsystemAttr(attr string, value string) error {
+	path := filepath.Join("/sys/kernel/config/nvmet/subsystems", subsystem.Name, attr)
+	err := os.WriteFile(path, []byte(value), os.ModePerm)
+	return err
+}
+
+func (namespace NvmfNamespace) createNamespace(subsystem NvmfSubsystem) error {
+	path := filepath.Join("/sys/kernel/config/nvmet/subsystems", subsystem.Name, "namespaces", strconv.Itoa(namespace.Name))
+	err := os.MkdirAll(path, os.ModePerm)
+	return err
+}
+
+func (namespace NvmfNamespace) writeNamespaceAttr(subsystem NvmfSubsystem, attr string, value string) error {
+	path := filepath.Join("/sys/kernel/config/nvmet/subsystems", subsystem.Name, "namespaces", strconv.Itoa(namespace.Name), attr)
+	err := os.WriteFile(path, []byte(value), os.ModePerm)
+	return err
+}
+
+func (port NvmfPort) createPort() error {
+	path := filepath.Join("/sys/kernel/config/nvmet/ports", port.Name)
+	err := os.MkdirAll(path, os.ModePerm)
+	return err
+}
+
+func (port NvmfPort) writePortAttr(attr string, value string) error {
+	path := filepath.Join("/sys/kernel/config/nvmet/ports", port.Name, attr)
+	err := os.WriteFile(path, []byte(value), os.ModePerm)
+	return err
+}
+
+func (port NvmfPort) bindSubsystem(subsystemName string) error {
+	pathSymlink := filepath.Join("/sys/kernel/config/nvmet/subsystems", subsystemName)
+	pathTarget := filepath.Join("/sys/kernel/config/nvmet/ports", port.Name, "subsystems", subsystemName)
+	err := os.Symlink(pathSymlink, pathTarget)
+	return err
 }
 
 func check(err error) {
@@ -39,81 +100,71 @@ func check(err error) {
 	}
 }
 
+// ImportFromFile reads nvmet state from file and set it to system
+func ImportFromFile(file string) {
+	dat, err := os.ReadFile(file)
+	check(err)
+
+	nvmf := Nvmf{}
+	err = yaml.Unmarshal([]byte(dat), &nvmf)
+	check(err)
+
+	for _, subsystem := range nvmf.Subsystems {
+
+		err = subsystem.createSubsystem()
+		check(err)
+
+		err = subsystem.writeAllowAnyHost()
+		check(err)
+
+		for _, namespace := range subsystem.Namespaces {
+			err := namespace.createNamespace(subsystem)
+			check(err)
+
+			err = namespace.writeNamespaceAttr(subsystem, "device_path", namespace.DevicePath)
+			check(err)
+
+			err = namespace.writeNamespaceAttr(subsystem, "device_uuid", namespace.DeviceUUID)
+			check(err)
+
+			err = namespace.writeNamespaceAttr(subsystem, "enable", strconv.Itoa(namespace.Enable))
+			check(err)
+		}
+	}
+
+	for _, port := range nvmf.Ports {
+		err = port.createPort()
+		check(err)
+
+		err = port.writePortAttr("addr_adrfam", port.AddrAdrfam)
+		check(err)
+
+		err = port.writePortAttr("addr_traddr", port.AddrTraddr)
+		check(err)
+
+		err = port.writePortAttr("addr_trsvcid", strconv.Itoa(port.AddrTrsvcid))
+		check(err)
+
+		err = port.writePortAttr("addr_trtype", port.AddrTrtype)
+		check(err)
+
+		for _, subsystem := range port.Subsystems {
+			err = port.bindSubsystem(subsystem.Name)
+			check(err)
+		}
+	}
+}
+
 func main() {
 	_, err := os.Stat("/sys/kernel/config/nvmet")
 	check(err)
 
 	args := os.Args[1:]
-	for _, arg := range args {
-		dat, err := os.ReadFile(arg)
-		check(err)
-
-		nvmf := Nvmf{}
-		err = yaml.Unmarshal([]byte(dat), &nvmf)
-		check(err)
-
-		subsystemPath := "/sys/kernel/config/nvmet/subsystems"
-
-		for _, subsystem := range nvmf.Subsystems {
-			path := filepath.Join(subsystemPath, subsystem.Name)
-			err = os.MkdirAll(path, os.ModePerm)
-			check(err)
-
-			path = filepath.Join(subsystemPath, subsystem.Name, "attr_allow_any_host")
-			err := os.WriteFile(path, []byte(strconv.Itoa(subsystem.AttrAllowAnyHost)), os.ModePerm)
-			check(err)
-
-			for _, namespaces := range subsystem.Namespaces {
-				path = filepath.Join(subsystemPath, subsystem.Name, "namespaces", strconv.Itoa(namespaces.Name))
-				err = os.MkdirAll(path, os.ModePerm)
-				check(err)
-
-				if namespaces.Enable == 0 {
-					path = filepath.Join(subsystemPath, subsystem.Name, "namespaces", strconv.Itoa(namespaces.Name), "device_path")
-					err := os.WriteFile(path, []byte(namespaces.DevicePath), os.ModePerm)
-					check(err)
-
-					path = filepath.Join(subsystemPath, subsystem.Name, "namespaces", strconv.Itoa(namespaces.Name), "device_uuid")
-					err = os.WriteFile(path, []byte(namespaces.DeviceUUID), os.ModePerm)
-					check(err)
-				}
-
-				path = filepath.Join(subsystemPath, subsystem.Name, "namespaces", strconv.Itoa(namespaces.Name), "enable")
-				err = os.WriteFile(path, []byte(strconv.Itoa(namespaces.Enable)), os.ModePerm)
-				check(err)
-			}
-		}
-
-		portPath := "/sys/kernel/config/nvmet/ports"
-
-		for _, port := range nvmf.Ports {
-			path := filepath.Join(portPath, port.Name)
-			err := os.MkdirAll(path, os.ModePerm)
-			check(err)
-
-			path = filepath.Join(portPath, port.Name, "addr_adrfam")
-			err = os.WriteFile(path, []byte(port.AddrAdrfam), os.ModePerm)
-			check(err)
-
-			path = filepath.Join(portPath, port.Name, "addr_traddr")
-			err = os.WriteFile(path, []byte(port.AddrTraddr), os.ModePerm)
-			check(err)
-
-			path = filepath.Join(portPath, port.Name, "addr_trsvcid")
-			err = os.WriteFile(path, []byte(strconv.Itoa(port.AddrTrsvcid)), os.ModePerm)
-			check(err)
-
-			path = filepath.Join(portPath, port.Name, "addr_trtype")
-			err = os.WriteFile(path, []byte(port.AddrTrtype), os.ModePerm)
-			check(err)
-
-			for _, subsystem := range port.Subsystems {
-				pathSymlink := filepath.Join(subsystemPath, subsystem.Name)
-				pathTarget := filepath.Join(portPath, port.Name, "subsystems", subsystem.Name)
-				err = os.Symlink(pathSymlink, pathTarget)
-				check(err)
-			}
-		}
+	switch args[0] {
+	case "import":
+		ImportFromFile(args[1])
+	default:
+		fmt.Println("invalid command")
+		os.Exit(1)
 	}
-
 }
